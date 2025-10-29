@@ -128,58 +128,73 @@ class CheckCommand(Command):
             for source in sorted(all_referenced_sources - sources)
         ]
 
-    def handle(self) -> int:
-        from poetry.core.pyproject.toml import PyProjectTOML
+def handle(self) -> int:
+    from poetry.core.pyproject.toml import PyProjectTOML
+    from poetry.factory import Factory
 
-        from poetry.factory import Factory
+    # Load poetry config and display errors, if any
+    poetry_file = self.poetry.file.path
+    toml_data = PyProjectTOML(poetry_file).data
+    check_result = Factory.validate(toml_data, strict=True)
 
-        # Load poetry config and display errors, if any
-        poetry_file = self.poetry.file.path
-        toml_data = PyProjectTOML(poetry_file).data
-        check_result = Factory.validate(toml_data, strict=True)
+    project = toml_data.get("project", {})
+    poetry_config = toml_data["tool"]["poetry"]
 
-        project = toml_data.get("project", {})
-        poetry_config = toml_data["tool"]["poetry"]
+    # Validate trove classifiers
+    project_classifiers = set(
+        project.get("classifiers") or poetry_config.get("classifiers", [])
+    )
+    errors, warnings = self._validate_classifiers(project_classifiers)
+    check_result["errors"].extend(errors)
+    check_result["warnings"].extend(warnings)
 
-        # Validate trove classifiers
-        project_classifiers = set(
-            project.get("classifiers") or poetry_config.get("classifiers", [])
-        )
-        errors, warnings = self._validate_classifiers(project_classifiers)
-        check_result["errors"].extend(errors)
-        check_result["warnings"].extend(warnings)
+    readme_errors = []
 
-        # Validate readme (files must exist)
-        # TODO: consider [project.readme] as well
-        if "readme" in poetry_config:
-            errors = self._validate_readme(poetry_config["readme"], poetry_file)
-            check_result["errors"].extend(errors)
+    # Check [tool.poetry.readme]
+    if "readme" in poetry_config:
+        readme_errors += self._validate_readme(poetry_config["readme"], poetry_file)
 
-        check_result["errors"] += self._validate_dependencies_source(poetry_config)
+    project_readme = project.get("readme")
+    if project_readme:
+        if isinstance(project_readme, dict):
+            readme_path = project_readme.get("file")
+            if readme_path:
+                readme_errors += self._validate_readme(readme_path, poetry_file)
+        elif isinstance(project_readme, str):
+            readme_errors += self._validate_readme(project_readme, poetry_file)
+        else:
+            readme_errors.append(
+                f"Invalid format for [project.readme]: {project_readme!r}"
+            )
 
-        # Verify that lock file is consistent
-        if self.option("lock") and not self.poetry.locker.is_locked():
-            check_result["errors"] += ["poetry.lock was not found."]
-        if self.poetry.locker.is_locked() and not self.poetry.locker.is_fresh():
-            check_result["errors"] += [
-                "pyproject.toml changed significantly since poetry.lock was last generated. "
-                "Run `poetry lock` to fix the lock file."
-            ]
+    check_result["errors"].extend(readme_errors)
 
-        return_code = 0
+    # Validate dependencies' sources
+    check_result["errors"] += self._validate_dependencies_source(poetry_config)
 
-        if check_result["errors"] or (
-            check_result["warnings"] and self.option("strict")
-        ):
-            return_code = 1
+    # Verify that lock file is consistent
+    if self.option("lock") and not self.poetry.locker.is_locked():
+        check_result["errors"] += ["poetry.lock was not found."]
+    if self.poetry.locker.is_locked() and not self.poetry.locker.is_fresh():
+        check_result["errors"] += [
+            "pyproject.toml changed significantly since poetry.lock was last generated. "
+            "Run `poetry lock` to fix the lock file."
+        ]
 
-        if not check_result["errors"] and not check_result["warnings"]:
-            self.info("All set!")
+    return_code = 0
 
-        for error in check_result["errors"]:
-            self.line_error(f"<error>Error: {error}</error>")
+    if check_result["errors"] or (
+        check_result["warnings"] and self.option("strict")
+    ):
+        return_code = 1
 
-        for error in check_result["warnings"]:
-            self.line_error(f"<warning>Warning: {error}</warning>")
+    if not check_result["errors"] and not check_result["warnings"]:
+        self.info("All set!")
 
-        return return_code
+    for error in check_result["errors"]:
+        self.line_error(f"<error>Error: {error}</error>")
+
+    for error in check_result["warnings"]:
+        self.line_error(f"<warning>Warning: {error}</warning>")
+
+    return return_code
